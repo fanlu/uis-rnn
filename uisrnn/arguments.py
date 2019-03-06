@@ -85,6 +85,18 @@ def parse_arguments():
       '0 for errors; 1 for finishing important steps; '
       '2 for finishing less important steps; 3 or above for debugging '
       'information.')
+  model_parser.add_argument(
+      '--sigma_alpha2',
+      default=1.0,
+      type=float,
+      help='The inverse gamma shape for estimating sigma2. This value is only '
+           'meaningful when sigma2 is not given, and estimated from data.')
+  model_parser.add_argument(
+      '--sigma_beta2',
+      default=1.0,
+      type=float,
+      help='The inverse gamma scale for estimating sigma2. This value is only '
+           'meaningful when sigma2 is not given, and estimated from data.')
 
   # training configurations
   training_parser = argparse.ArgumentParser(
@@ -118,11 +130,29 @@ def parse_arguments():
       type=int,
       help='The total number of training iterations.')
   training_parser.add_argument(
+      '--epochs',
+      '-e',
+      default=20,
+      type=int,
+      help='The total number of training epochs.')
+  training_parser.add_argument(
       '--batch_size',
       '-b',
       default=10,
       type=int,
       help='The batch size for training.')
+  training_parser.add_argument(
+      '--num_workers',
+      '-nw',
+      default=16,
+      type=int,
+      help='The num of workers.')
+  training_parser.add_argument(
+      '--ngpu',
+      '-ngpu',
+      default=4,
+      type=int,
+      help='The num of gpus.')
   training_parser.add_argument(
       '--num_permutations',
       default=10,
@@ -161,10 +191,37 @@ def parse_arguments():
            'is a list of sequences. In general, assume the cluster IDs for two '
            'sequences are [a, b] and [a, c]. If the `a` from the two sequences '
            'are not the same label, then this arg should be True.')
+  training_parser.add_argument(
+      '--dvector_dir',
+      default='',
+      type=str,
+      help='dvector_dir')
+  training_parser.add_argument(
+      '--checkpoint_dir',
+      default='./checkpint_dir',
+      type=str,
+      help='checkpoint_dir')
+  training_parser.add_argument(
+      '--training',
+      default=True,
+      type=bool,
+      help='training')
 
   # inference configurations
   inference_parser = argparse.ArgumentParser(
       description='Inference configurations.', add_help=False)
+
+  inference_parser.add_argument(
+      '--model',
+      default='./checkpint_dir_1/saved_model.uisrnn',
+      type=str,
+      help='model')
+
+  inference_parser.add_argument(
+      '--dvector_dir_inference',
+      default='',
+      type=str,
+      help='dvector_dir')
 
   inference_parser.add_argument(
       '--beam_size',
