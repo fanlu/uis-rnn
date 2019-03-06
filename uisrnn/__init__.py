@@ -18,6 +18,7 @@ from . import evals
 from . import loss_func
 from . import uisrnn
 from . import utils
+from . import data_load
 
 #pylint: disable=C0103
 parse_arguments = arguments.parse_arguments

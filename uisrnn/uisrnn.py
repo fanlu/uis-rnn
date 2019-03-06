@@ -19,7 +19,10 @@ from torch import autograd
 from torch import nn
 from torch import optim
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.autograd import Variable
 
+from uisrnn.data_load import collate_fn
 from uisrnn import loss_func
 from uisrnn import utils
 
@@ -47,6 +50,107 @@ class CoreRNN(nn.Module):
     mean = self.linear_mean2(F.relu(self.linear_mean1(output_seq)))
     return mean, hidden
 
+class SpeechEmbedder2(nn.Module):
+
+    def __init__(self, input_dim, hidden_size, depth, observation_dim, dropout=0, bidirectional=False):
+        super(SpeechEmbedder2, self).__init__()
+        self.LSTM_stack = nn.LSTM(input_dim, hidden_size, num_layers=depth, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        for name, param in self.LSTM_stack.named_parameters():
+          if 'bias' in name:
+             nn.init.constant_(param, 0.0)
+          elif 'weight' in name:
+             nn.init.xavier_normal_(param)
+        self.bidirectional = bidirectional
+        if self.bidirectional:
+            hidden_size *= 2
+        self.projection = nn.Linear(hidden_size, hidden_size)
+        self.projection2 = nn.Linear(hidden_size, observation_dim)
+
+    def forward(self, x, x_len):
+        #import pdb;pdb.set_trace()
+        _, idx_sort = torch.sort(x_len, dim=0, descending=True)
+        _, idx_unsort = torch.sort(idx_sort, dim=0)
+        input_x = torch.index_select(x, 0, idx_sort)
+        length_list = list(x_len[idx_sort])
+        pack = torch.nn.utils.rnn.pack_padded_sequence(input_x, length_list, batch_first=True)
+        #self.LSTM_stack.flatten_parameters()
+        x, (ht, ct) = self.LSTM_stack(pack) #(batch, frames, n_mels)
+        #if isinstance(x, PackedSequence):
+        #    x = x[0]
+        #    out = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        if self.bidirectional:
+            output = torch.cat((ht[-1], ht[-2]), dim=-1)
+        else:
+            output = ht[-1]
+        output = output[idx_unsort]
+        #print("1", x.shape)
+        #only use last frame
+        #x = x[:,x.size(1)-1]
+        #print("2", x.shape)
+        x = self.projection(output)
+        #print("3", x.shape)
+        x = F.normalize(x, dim=-1, eps=1e-6)
+        #print("4", torch.norm(x).shape)
+        #print("--------", x.shape)
+        return x
+
+class CoreRNN2(nn.Module):
+  """The core Recurent Neural Network used by UIS-RNN."""
+
+  def __init__(self, input_dim, hidden_size, depth, observation_dim, dropout=0):
+    super(CoreRNN2, self).__init__()
+    self.hidden_size = hidden_size
+    self.rnn_init_hidden = nn.Parameter(torch.zeros(depth, 1, hidden_size))
+    if depth >= 2:
+      self.gru = nn.GRU(input_dim, hidden_size, depth, dropout=dropout)
+    else:
+      self.gru = nn.GRU(input_dim, hidden_size, depth)
+    self.linear_mean1 = nn.Linear(hidden_size, hidden_size)
+    self.linear_mean2 = nn.Linear(hidden_size, observation_dim)
+    self.observation_dim = observation_dim
+
+  def forward(self, seq, seq_length):
+    hidden = self.rnn_init_hidden.repeat(1, seq.shape[1], 1)
+    _, idx_sort = torch.sort(seq_length, dim=0, descending=True)
+    _, idx_unsort = torch.sort(idx_sort, dim=0)
+    input_x = torch.index_select(seq, 1, idx_sort)
+    length_list = list(seq_length[idx_sort])
+    packed_train_sequence = torch.nn.utils.rnn.pack_padded_sequence(input_x, length_list, batch_first=False)
+    #print(seq.shape, input_x.shape, seq_length, length_list, packed_train_sequence[0].shape)
+    output_seq, hidden = self.gru(packed_train_sequence, hidden)
+    if isinstance(output_seq, torch.nn.utils.rnn.PackedSequence):
+      output_seq, _ = torch.nn.utils.rnn.pad_packed_sequence(
+          output_seq, batch_first=False)
+    output_seq = output_seq[:,idx_unsort,:]
+    mean = self.linear_mean2(F.relu(self.linear_mean1(output_seq)))
+    return mean, hidden
+
+class UISLoss(nn.Module):
+
+  def __init__(self, sigma2, observation_dim, sigma_alpha, sigma_beta):
+    super(UISLoss, self).__init__()
+    self.observation_dim = observation_dim
+    self.sigma2 = nn.Parameter(sigma2 * torch.ones(self.observation_dim), requires_grad=True)
+    self.sigma_alpha = sigma_alpha
+    self.sigma_beta = sigma_beta
+
+  def forward(self, mean, rnn_truth):
+    # Likelihood part.
+    torch.clamp(self.sigma2, 1e-6)
+    #print(rnn_truth.size(), mean.size())
+    loss1 = loss_func.weighted_mse_loss(
+      input_tensor=(rnn_truth != 0).float() * mean[:-1, :, :],
+      target_tensor=rnn_truth,
+      weight=1 / (2 * self.sigma2))
+    # Sigma2 prior part.
+    #print(self.sigma2)
+    weight = (((rnn_truth != 0).float() * mean[:-1, :, :] - rnn_truth)
+              ** 2).view(-1, self.observation_dim)
+    num_non_zero = torch.sum((weight != 0).float(), dim=0).squeeze()
+    loss2 = loss_func.sigma2_prior_loss(
+        num_non_zero, self.sigma_alpha, self.sigma_beta, self.sigma2)
+
+    return loss1, loss2
 
 class BeamState:
   """Structure that contains necessary states for beam search."""
@@ -85,18 +189,20 @@ class UISRNN:
     self.observation_dim = args.observation_dim
     self.device = torch.device(
         'cuda:0' if torch.cuda.is_available() else 'cpu')
+    #self.device = torch.device('cpu')
     self.rnn_model = CoreRNN(self.observation_dim, args.rnn_hidden_size,
                              args.rnn_depth, self.observation_dim,
                              args.rnn_dropout).to(self.device)
-    self.rnn_init_hidden = nn.Parameter(
-        torch.zeros(args.rnn_depth, 1, args.rnn_hidden_size).to(self.device))
+
+    self.rnn_init_hidden = nn.Parameter(torch.zeros(args.rnn_depth, 1, args.rnn_hidden_size).to(self.device))
+
     # booleans indicating which variables are trainable
     self.estimate_sigma2 = (args.sigma2 is None)
     self.estimate_transition_bias = (args.transition_bias is None)
     # initial values of variables
     sigma2 = _INITIAL_SIGMA2_VALUE if self.estimate_sigma2 else args.sigma2
-    self.sigma2 = nn.Parameter(
-        sigma2 * torch.ones(self.observation_dim).to(self.device))
+    self.crit = UISLoss(sigma2, self.observation_dim, args.sigma_alpha2, args.sigma_beta2)
+    self.sigma2 = nn.Parameter(sigma2 * torch.ones(self.observation_dim).to(self.device))
     self.transition_bias = args.transition_bias
     self.transition_bias_denominator = 0.0
     self.crp_alpha = args.crp_alpha
@@ -123,8 +229,12 @@ class UISRNN:
     ]
     if self.estimate_sigma2:  # train sigma2
       params.append({
-          'params': self.sigma2
+          'params': self.crit.parameters()
+          #'params': self.sigma2
       })  # variance parameters
+      params.append({
+          'params': self.sigma2
+      })
     assert optimizer == 'adam', 'Only adam optimizer is supported.'
     return optim.Adam(params, lr=learning_rate)
 
@@ -142,14 +252,32 @@ class UISRNN:
         'crp_alpha': self.crp_alpha,
         'sigma2': self.sigma2.detach().cpu().numpy()}, filepath)
 
+  def save2(self, filepath):
+    """Save the model to a file.
+
+    Args:
+      filepath: the path of the file.
+    """
+    #import pdb;pdb.set_trace()
+    torch.save({
+        'rnn_state_dict': self.rnn_model.module.state_dict(),
+        'rnn_init_hidden': self.rnn_model.module.rnn_init_hidden.detach().cpu().numpy(),
+        'transition_bias': self.transition_bias,
+        'transition_bias_denominator': self.transition_bias_denominator,
+        'crp_alpha': self.crp_alpha,
+        'sigma2': self.crit.module.sigma2.detach().cpu().numpy()}, filepath)
+
   def load(self, filepath):
     """Load the model from a file.
 
     Args:
       filepath: the path of the file.
     """
-    var_dict = torch.load(filepath)
+    var_dict = torch.load(filepath, map_location='cpu')
+    if "rnn_init_hidden" in var_dict['rnn_state_dict']:
+      del var_dict['rnn_state_dict']['rnn_init_hidden']
     self.rnn_model.load_state_dict(var_dict['rnn_state_dict'])
+    self.rnn_model.to(self.device)
     self.rnn_init_hidden = nn.Parameter(
         torch.from_numpy(var_dict['rnn_init_hidden']).to(self.device))
     self.transition_bias = float(var_dict['transition_bias'])
@@ -164,6 +292,76 @@ class UISRNN:
         'rnn_init_hidden={}'.format(
             self.transition_bias, self.crp_alpha, var_dict['sigma2'],
             var_dict['rnn_init_hidden']))
+
+  def fit2(self, dataset, args):
+    if args.ngpu >= 1:
+      self.rnn_model = torch.nn.DataParallel(self.rnn_model.cuda(), device_ids=list(range(args.ngpu)))
+      self.crit = torch.nn.DataParallel(self.crit.cuda(), device_ids=list(range(args.ngpu)))
+    self.transition_bias = dataset.bias
+    self.transition_bias_denominator = dataset.bias_denominator
+    train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True, collate_fn=collate_fn)
+    device = torch.device("cuda" if args.ngpu > 0 else "cpu")
+    optimizer = self._get_optimizer(optimizer=args.optimizer,
+                                    learning_rate=args.learning_rate)
+    self.rnn_model.train()
+    self.crit.train()
+    #import pdb;pdb.set_trace()
+    num_iter = 0
+    train_loss = []
+    for e in range(args.epochs):
+      for batch_id, data in enumerate(train_loader):
+        if args.learning_rate_half_life > 0:
+          if num_iter > 0 and num_iter % args.learning_rate_half_life == 0:
+            optimizer.param_groups[0]['lr'] /= 2.0
+            self.logger.print(2, 'Changing learning rate to: {}'.format(
+                optimizer.param_groups[0]['lr']))
+        seq, seq_length = data
+        #seq, seq_length = seq[:,:args.batch_size*2,:].to(device), seq_length[:args.batch_size*2].to(device)
+        seq, seq_length = seq.to(device), seq_length.to(device)
+        rnn_truth = seq[1:, :, :]
+        #hidden = nn.Parameter(self.rnn_init_hidden.repeat(1, int(seq_length.shape[0]/args.ngpu), 1).to(device))
+        optimizer.zero_grad()
+        mean, _ = self.rnn_model(seq, seq_length)
+        #print(seq.size(), mean.size())
+	# use mean to predict
+        mean = torch.cumsum(mean, dim=0)
+        mean_size = mean.size()
+        mean = torch.mm(
+            torch.diag(
+                1.0 / torch.arange(1, mean_size[0] + 1).float().to(device)),
+            mean.view(mean_size[0], -1))
+        mean = mean.view(mean_size)
+        loss1, loss2 = self.crit(mean, rnn_truth)
+
+        # Regularization part.
+        loss3 = loss_func.regularization_loss(
+            self.rnn_model.parameters(), args.regularization_weight)
+        loss = loss1 + loss2 + loss3
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.rnn_model.parameters(), args.grad_max_norm)
+        #nn.utils.clip_grad_norm_(self.crit.parameters(), args.grad_max_norm)
+        optimizer.step()
+        # avoid numerical issues
+        # self.crit.sigma2.data.clamp_(min=1e-6)
+
+        if (np.remainder(num_iter, 10) == 0 or
+            num_iter == args.train_iteration - 1):
+          self.logger.print(
+              2,
+              'Iter: {:d}  \t'
+              'Training Loss: {:.4f}    \t'
+              '    Negative Log Likelihood: {:.4f}\t'
+              'Sigma2 Prior: {:.4f}\t'
+              'Regularization: {:.4f}'.format(
+                  num_iter,
+                  float(loss.data),
+                  float(loss1.data),
+                  float(loss2.data),
+                  float(loss3.data)))
+        num_iter += 1
+        train_loss.append(float(loss1.data))  # only save the likelihood part
+      self.logger.print(
+        1, 'Done training with {} epochs {} iterations'.format(e, args.train_iteration))
 
   def _fit_concatenated(self, train_sequence, train_cluster_id, args):
     """Fit UISRNN model to concatenated sequence and cluster_id.
@@ -297,6 +495,7 @@ class UISRNN:
       nn.utils.clip_grad_norm_(self.rnn_model.parameters(), args.grad_max_norm)
       optimizer.step()
       # avoid numerical issues
+      #print(self.sigma2)
       self.sigma2.data.clamp_(min=1e-6)
 
       if (np.remainder(num_iter, 10) == 0 or
@@ -340,6 +539,7 @@ class UISRNN:
     Raises:
       TypeError: If train_sequences or train_cluster_ids is of wrong type.
     """
+    #import pdb;pdb.set_trace()
     if isinstance(train_sequences, np.ndarray):
       # train_sequences is already the concatenated sequence
       concatenated_train_sequence = train_sequences
@@ -495,6 +695,7 @@ class UISRNN:
         torch.from_numpy(test_sequence).float()).to(self.device)
     # bookkeeping for beam search
     beam_set = [BeamState()]
+    #import pdb;pdb.set_trace()
     for num_iter in np.arange(0, args.test_iteration * test_sequence_length,
                               args.look_ahead):
       max_clusters = max([len(beam_state.mean_set) for beam_state in beam_set])
