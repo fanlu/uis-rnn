@@ -33,15 +33,14 @@ def diarization_experiment(model_args, training_args, inference_args):
     training_args: training configurations
     inference_args: inference configurations
   """
+  #test_record = []
 
-  test_record = []
-
-  train_data = np.load('./data/toy_training_data.npz')
-  test_data = np.load('./data/toy_testing_data.npz')
-  train_sequence = train_data['train_sequence']
-  train_cluster_id = train_data['train_cluster_id']
-  test_sequences = test_data['test_sequences'].tolist()
-  test_cluster_ids = test_data['test_cluster_ids'].tolist()
+  #train_data = np.load('./data/toy_training_data.npz')
+  #test_data = np.load('./data/toy_testing_data.npz')
+  #train_sequence = train_data['train_sequence']
+  #train_cluster_id = train_data['train_cluster_id']
+  #test_sequences = test_data['test_sequences'].tolist()
+  #test_cluster_ids = test_data['test_cluster_ids'].tolist()
   #train_data = np.load('./data/training_data.npz')
   #test_data = np.load('./data/testing_data.npz')
   #train_sequence = train_data['train_sequence']
